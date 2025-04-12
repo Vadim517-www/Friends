@@ -1,9 +1,16 @@
 const express = require('express');
+const cors = require('cors');
 const bodyParser = require('body-parser');
 const sqlite3 = require('sqlite3').verbose();
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const SECRET_KEY = 'your_secret_key';
 
 const app = express();
 const port = 3000;
+
+app.use(cors());
+app.use(bodyParser.json());
 
 // Підключення до бази даних SQLite
 const db = new sqlite3.Database('./users.db', (err) => {
@@ -33,13 +40,88 @@ db.serialize(() => {
             FOREIGN KEY (friend_id) REFERENCES users (id) ON DELETE CASCADE
         )
     `);
+
+    db.run(`
+        CREATE TABLE IF NOT EXISTS auth_users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL
+        )
+    `);
 });
 
-app.use(bodyParser.json());
+// Middleware для перевірки токена
+function authenticateToken(req, res, next) {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+
+    if (!token) return res.sendStatus(401);
+
+    jwt.verify(token, SECRET_KEY, (err, user) => {
+        if (err) return res.sendStatus(403);
+        req.user = user;
+        next();
+    });
+}
 
 // Головна сторінка
 app.get('/', (req, res) => {
     res.send('Welcome to the REST API server for User entity!');
+});
+
+// Реєстрація користувача
+app.post('/auth/register', async (req, res) => {
+    const { username, password } = req.body;
+    if (!username || !password) {
+        return res.status(400).json({ message: 'Username and password are required' });
+    }
+
+    try {
+        const hashedPassword = await bcrypt.hash(password, 10);
+        const sql = 'INSERT INTO auth_users (username, password) VALUES (?, ?)';
+        db.run(sql, [username, hashedPassword], function (err) {
+            if (err) {
+                if (err.message.includes('UNIQUE constraint failed')) {
+                    return res.status(400).json({ message: 'Username already exists' });
+                }
+                return res.status(500).json({ message: 'Error registering user', error: err.message });
+            }
+            res.status(201).json({ message: 'User registered successfully', userId: this.lastID });
+        });
+    } catch (err) {
+        res.status(500).json({ message: 'Internal error', error: err.message });
+    }
+});
+
+// Логін користувача
+app.post('/auth/login', (req, res) => {
+    const { username, password } = req.body;
+    if (!username || !password) {
+        return res.status(400).json({ message: 'Username and password are required' });
+    }
+
+    const sql = 'SELECT * FROM auth_users WHERE username = ?';
+    db.get(sql, [username], async (err, user) => {
+        if (err) {
+            return res.status(500).json({ message: 'Database error', error: err.message });
+        }
+        if (!user) {
+            return res.status(401).json({ message: 'Invalid username or password' });
+        }
+
+        const isMatch = await bcrypt.compare(password, user.password);
+        if (!isMatch) {
+            return res.status(401).json({ message: 'Invalid username or password' });
+        }
+
+        const token = jwt.sign({ id: user.id, username: user.username }, SECRET_KEY, { expiresIn: '1h' });
+        res.json({ token });
+    });
+});
+
+// Захищений приклад-роут
+app.get('/auth/protected', authenticateToken, (req, res) => {
+    res.json({ message: 'Access granted to protected route', user: req.user });
 });
 
 // Отримати всіх користувачів
@@ -122,9 +204,13 @@ app.delete('/users/:id', (req, res) => {
 });
 
 // Додати друга
-app.post('/users/:id/friends', (req, res) => {
+app.post('/users/:id/friends', authenticateToken, (req, res) => {
     const userId = parseInt(req.params.id, 10);
     const { friendId } = req.body;
+
+    if (req.user.id !== userId) {
+        return res.status(403).json({ message: 'Forbidden: you can only add friends to your own account' });
+    }
 
     if (!friendId) {
         return res.status(400).json({ message: 'Friend ID is required' });
